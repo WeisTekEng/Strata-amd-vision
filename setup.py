@@ -4721,13 +4721,12 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
     engine_ok = meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src and has_archs and \
         (meta.get("isa_floor") or "") == floor and not stale_binary(eng / EXE)
-    vision_ok = vision == "none" or ((eng / VEXE).exists() and meta.get("vision_src") == vsrc and
-                                     (vision != "gpu" or ((eng / HVEXE).exists() and set(archs) <= set(arch_names(meta.get("vision_archs"))))))
+    vision_ok = vision == "none" or ((eng / VEXE).exists() and meta.get("vision_src") == vsrc)
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
         return eng
     if engine_ok:
-        return build_vision_hip(eng, stamp, meta, llama, vsrc, archs, vision)
+        return build_vision_cpu(eng, stamp, meta, llama, vsrc)
     if not (shutil.which("c++") or shutil.which("g++")) or not shutil.which("git"):
         fail("a C++ compiler and git are needed to compile the AMD engine",
              "Ubuntu/Debian: sudo apt install build-essential git   Fedora: sudo dnf install gcc-c++ git")
@@ -4758,80 +4757,23 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     meta = {"source": "local-hip", "backend": "hip", "version": source_version(), "archs": archs, "vision": "none",
             "lib_dirs": dirs, "src": src, **({"isa_floor": floor} if floor else {})}
     if vision != "none":
-        return build_vision_hip(eng, stamp, meta, llama, vsrc, archs, vision)
+        return build_vision_cpu(eng, stamp, meta, llama, vsrc)
     stamp.write_text(json.dumps(meta, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
 
-def hip_vision(asked, vram_gb: float = 0.0) -> str:
-    """The picture reader wanted with the AMD backend (--vision): when nothing was asked or "yes" (pictures are on by default) the
-    default of strata_control/vision_reader.py for this card - the CPU reader under 24 GB, the GPU reader from 24 GB (owner decision
-    2026-10-18, every make of card); "gpu" / "cpu" as asked (#304), "none" for no.  "gpu" is a wish: hip_reader() settles it against
-    what the engine folder carries (the HIP reader, else the CPU one) once the engine is known."""
-    from strata_control import vision_reader as VR
-    return VR.wanted(asked, vram_gb)
-
-
-def reader_archs(eng: Path) -> list:
-    """The GPU architectures the engine folder's HIP picture reader was built for: its BUILD.json (vision_archs, else archs),
-    else the component manifest's archs; [] when neither says (the reader then checks the card itself when it starts)."""
-    for name, keys in (("BUILD.json", ("vision_archs", "archs")), ("engine-component.json", ("archs",))):
-        try:
-            data = json.loads((eng / name).read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            continue
-        for key in keys:
-            if isinstance(data, dict) and arch_names(data.get(key)):
-                return arch_names(data.get(key))
-    return []
-
-
-def hip_reader(eng: Path, vision: str, gpu: dict):
-    """AMD: the picture reader this engine folder gets for `vision` ("gpu" or "cpu"; strata_control/vision_reader.py): the HIP
-    reader with the CPU reader to fall back on, else the CPU reader.  Returns (vision, Reader); a Reader of mode "none" means
-    the folder has no reader.  The one plain note (a card the HIP reader has no code for, no HIP reader in this engine) is said."""
-    from strata_control import vision_reader as VR
-    r = VR.choose(eng, vision, windows=WIN, gpu_arch=str(gpu.get("arch") or ""), archs=reader_archs(eng))
-    if r.note:
-        warn(r.note)
-    return r.mode, r
-
-
-def build_vision_hip(eng: Path, stamp: Path, meta: dict, llama, vsrc, archs: list, vision: str) -> Path:
-    """The picture readers beside the HIP engine: the CPU reader always (the fallback), and for "gpu" the HIP reader
-    (tools/vision, STRATA_VISION_HIP) for the same architectures.  The HIP reader needs the ROCm environment the engine build
-    sets; a build that fails leaves the CPU reader and says so (pictures still work, on the CPU)."""
-    if vision == "gpu" and not (shutil.which("hipconfig") or os.environ.get("ROCM_PATH")):
-        root, dirs = rocm_root(archs)                    # the engine was built earlier: set the same environment again
-        os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr", "ROCM_PATH": str(root),
-                           "HIP_PATH": str(root)})
-        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
-        os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
-    build_vision_cpu(eng, stamp, meta, llama, vsrc)
-    meta = json.loads(stamp.read_text(encoding="utf-8"))
-    if vision != "gpu":
-        return eng
-    root, dirs = rocm_root(archs)
-    libs = [str(Path(d).parent) for d in dirs[1:]]
-    bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode", root / "amdgcn" / "bitcode") if p.is_dir()),
-                   root / "amdgcn" / "bitcode")
-    say("  Compiling the picture reader for your AMD GPU (a few minutes, once) ...")
-    try:
-        cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision-hip", "strata-vision",
-                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_HIP=ON", "-DSTRATA_VISION_HIP_ARCHS=" + ";".join(archs),
-                     "-DSTRATA_PORTABLE=OFF", f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
-                     f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}", "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
-                     f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"], None, "")
-        shutil.copy2(ROOT / "build-vision-hip" / "bin" / HVEXE, eng / HVEXE)
-    except SystemExit:
-        raise
-    except Exception as e:                               # noqa: BLE001 - the CPU reader is there; pictures work without the GPU one
-        warn(f"the GPU picture reader did not compile ({e}): pictures are read on the CPU")
-        return eng
-    stamp.write_text(json.dumps({**meta, "vision": "gpu", "vision_archs": archs, "vision_gpu": HVEXE, "vision_cpu": VEXE}, indent=1))
-    ok(f"picture reader (GPU): {eng / HVEXE}, (CPU fallback): {eng / VEXE}")
-    return eng
+def hip_vision(asked) -> str:
+    """The image encoder with the AMD backend (--vision): the CPU one when asked for (#304); a HIP (GPU) encoder build
+    is a later step, so `yes`/`gpu` leave images off, as before, and say how to get them."""
+    if asked in ("yes", "gpu"):
+        warn("the AMD backend has no GPU image encoder yet: images off"
+             + ("" if WIN else " (--vision cpu reads them on the CPU)"))
+    if asked == "cpu" and WIN:
+        warn("images on the CPU with an AMD card are Linux-only for now (the ready-made Windows AMD engine has no "
+             "image encoder): images off")
+        return "none"
+    return "cpu" if asked == "cpu" else "none"
 
 
 def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
@@ -4840,7 +4782,7 @@ def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
         say("  Compiling the image encoder (for the CPU) ...")
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
                     [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"],
-                    find_vcvars() if WIN else None,
+                    find_vcvars((13, 3)) if WIN else None,
                     "build-vision-cpu.bat" if WIN else "")   # #881: MSVC's environment on Windows, as the CUDA path has
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     stamp.write_text(json.dumps({**meta, "vision": "cpu", "vision_src": vsrc}, indent=1))
@@ -6422,6 +6364,21 @@ SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8", "STRATA_ROUTE_TA
 SETUP_VISION = frozenset({"exe", "cpu_exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 
+def remembered_vision(tag: str) -> str | None:
+    """The image mode this model's own config already has ("cpu", "gpu" or None), so a setup run again does not take
+    the pictures away from a model that could read them: without --vision, hip_vision answers "none" (#1299)."""
+    p = ROOT / f"strata-{tag.lower()}.json"
+    if not p.is_file():
+        return None
+    try:
+        vis = json.loads(p.read_text(encoding="utf-8-sig")).get("vision")
+    except (OSError, ValueError):
+        return None
+    if isinstance(vis, dict) and vis.get("exe"):
+        return "gpu" if vis.get("gpu") else "cpu"      # a flag: setup writes `vision == "gpu"`, the server tests its truth
+    return None
+
+
 def carry_over(old: dict, cfg: dict, explicit: list[str] | None = None) -> list[str]:
     """#629: setup run again for an installed model keeps what the user added to its run config: every key setup does
     not write (`SETUP_KEYS`), the "env" entries setup does not write, and in "vision" the keys setup does not write
@@ -7663,6 +7620,8 @@ def engine_step(a, gpu, hip, amd, cuda_tk, vision):
                  "START-HERE.bat --backend hip --prebuilt <its dist folder> (docs/AMD_HIP.md)")
         gpu = hip_card(eng, gpu, amd)
         a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
+        if vision != "none" and not win_hip_vision(eng, llama, vision):
+            vision = "none"
     else:
         eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision, **({"toolkit": 12} if cuda_tk == 12
                                                                                     else {}))
@@ -9130,7 +9089,7 @@ def main() -> int:
             + "   (recommended)")
         say("  2) AMD: " + ", ".join(f"{g['name']} ({g['vram_gb']:.0f} GB{', unified memory' if g.get('uma') else ''})"
                                for g in amd_ok)
-            + f"   ({'the ready-made AMD engine' if WIN else 'compiled here'}, pictures on"
+            + f"   ({'the ready-made AMD engine, no images' if WIN else 'compiled here, images on the CPU'}"
               " - docs/AMD_HIP.md)")
         say("  One engine drives the cards of one make: a model is never split across NVIDIA and AMD cards, and two models at the same")
         say("  time, one on each, is not supported yet.")
@@ -9541,9 +9500,10 @@ def main() -> int:
         if a.vision not in (None, "no", "none"):
             warn(f"images are not available with {model} yet: off")
     elif hip:
-        # Unsloth's files on AMD: pictures on by default, the reader by the 24 GB rule (hip_vision; docs/QUANTS.md)
-        vision = hip_vision(a.vision if a.vision is not None or not images_default(model, family, ram, gpu)
-                            else "yes", float((gpu or {}).get("vram_gb") or 0.0))
+        # MODEL-UPDATE: Unsloth's files on AMD (Linux) read images with the CPU encoder by default where their experts
+        # all stay in RAM (it takes no VRAM; measured on an R9700 with UD-Q4_K_XL and UD-Q5_K_XL, docs/QUANTS.md)
+        vision = hip_vision(a.vision if a.vision is not None or not unsloth_images_default(model, family, ram, gpu)
+                            else "cpu")
     elif a.vision:
         vision = flash_vision_encoder(a.vision, gpu) if a.vision != "no" else "none"
         vision = "none" if vision in ("no", "none") else vision

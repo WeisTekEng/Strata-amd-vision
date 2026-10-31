@@ -34,6 +34,16 @@ if(STRATA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
+# Ninja + MSVC leaves CMAKE_SYSTEM_PROCESSOR empty (the compiler ABI check is skipped for cl.exe), and ggml then prints
+# "Unknown CPU architecture. Falling back to generic implementations." and builds its quant and CPU kernels without
+# AVX2.  Measured on an AMD Ryzen with MSVC 14.44 and CMake 4.4.3: the same picture at 1,024 image tokens took over
+# 300 s with the generic kernels and 13 s with the AVX2 ones.  A build here is for this PC, so name its architecture
+# when the generator did not (#1299).
+if(WIN32 AND NOT CMAKE_SYSTEM_PROCESSOR)
+  set(CMAKE_SYSTEM_PROCESSOR "AMD64")
+  message(STATUS "strata-vision: CMAKE_SYSTEM_PROCESSOR was empty, set to AMD64 (Windows x64)")
+endif()
+
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -67,29 +77,6 @@ else()
 endif()
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA ${STRATA_VISION_CUDA} CACHE BOOL "" FORCE)
-set(GGML_HIP ${STRATA_VISION_HIP} CACHE BOOL "" FORCE)
-if(APPLE)
-  # One program for both readers: strata-vision --gpu runs the encoder on the Metal GPU, without --gpu on the CPU (Apple Silicon always
-  # has the Metal framework, the engine needs it too).  The Metal shaders are embedded in the binary and compiled by macOS when the
-  # reader starts, so nothing but the program has to be shipped.  No -march flag: the default target (an M1) runs on every Apple
-  # Silicon Mac, and ggml's CPU path has no BF16 vector kernel on ARM (measured on an M4: the same ~50 s for a 260-token picture with
-  # -march=armv8.6-a+bf16+i8mm as without), so a faster target would only risk the M1.
-  set(GGML_METAL ${STRATA_VISION_METAL} CACHE BOOL "" FORCE)
-  set(GGML_METAL_EMBED_LIBRARY ${STRATA_VISION_METAL} CACHE BOOL "" FORCE)
-endif()
-set(GGML_SYCL ${STRATA_VISION_SYCL} CACHE BOOL "" FORCE)
-if(STRATA_VISION_SYCL)
-  set(GGML_SYCL_TARGET "INTEL" CACHE STRING "" FORCE)
-endif()
-if(STRATA_VISION_HIP)
-  # the engine's HIP build says the same (cmake/hip_backend.cmake); ggml-hip reads AMDGPU_TARGETS / CMAKE_HIP_ARCHITECTURES
-  set(AMDGPU_TARGETS "${STRATA_VISION_HIP_ARCHS}" CACHE STRING "" FORCE)
-  set(GPU_TARGETS "${STRATA_VISION_HIP_ARCHS}" CACHE STRING "" FORCE)
-  set(CMAKE_HIP_ARCHITECTURES "${STRATA_VISION_HIP_ARCHS}" CACHE STRING "" FORCE)
-  # #3359: a Linux toolchain links a PIE; ggml-hip's objects must be position independent (the engine's HIP build says the same in
-  # cmake/hip_backend.cmake).  Only for the HIP reader: the other readers' builds stay as they were.
-  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-endif()
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 
